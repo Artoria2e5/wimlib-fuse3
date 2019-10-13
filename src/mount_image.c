@@ -78,6 +78,12 @@
 
 #define WIMLIB_UNMOUNT_FLAG_SEND_PROGRESS 0x80000000
 
+#if FUSE_MAJOR_VERSION > 2
+#define FI_ARG , struct fuse_file_info *fi
+#else
+#define FI_ARG
+#endif
+
 struct wimfs_unmount_info {
 	unsigned unmount_flags;
 	char mq_name[WIMFS_MQUEUE_NAME_LEN + 1];
@@ -183,7 +189,7 @@ struct wimfs_context {
  * Note: this is a per-thread variable.  It is possible for different threads to
  * mount different images at the same time in the same process, although they
  * must use different WIMStructs!  */
-static inline struct wimfs_context *
+static inline __attribute__((pure)) struct wimfs_context *
 wimfs_get_context(void)
 {
 	return WIMFS_CTX(fuse_get_context());
@@ -580,6 +586,36 @@ blob_stored_size(const struct blob_descriptor *blob)
 	return blob->size;
 }
 
+
+/**
+ * Like inode_get_unix_data(), but provide defaults when not available.
+ *
+ * Always succeeds; return value is whether inode_get_unix_data is used.
+ */
+static bool
+inode_get_unix_data_fallback(const struct wimfs_context* ctx,
+    const struct wim_inode* inode,
+    struct wimlib_unix_data* unix_data)
+{
+	if ((ctx->mount_flags & WIMLIB_MOUNT_FLAG_UNIX_DATA) &&
+	    inode_get_unix_data(inode, unix_data))
+	{
+		/* Use the user ID, group ID, mode, and device ID from the
+		 * inode's extra UNIX metadata information.  */
+		return true;
+	} else {
+		/* Generate default values for the user ID, group ID, and mode.
+		 *
+		 * Note: in the case of an allow_other mount, fuse_context.uid
+		 * may not be the same as wimfs_context.owner_uid!  */
+		unix_data->uid = ctx->owner_uid;
+		unix_data->gid = ctx->owner_gid;
+		unix_data->mode = inode_default_unix_mode(inode);
+		unix_data->rdev = 0;
+		return false;
+	}
+}
+
 /*
  * Retrieve standard UNIX metadata ('struct stat') for a WIM inode.
  *
@@ -597,24 +633,7 @@ inode_to_stbuf(const struct wim_inode *inode,
 	struct wimlib_unix_data unix_data;
 
 	memset(stbuf, 0, sizeof(struct stat));
-	if ((ctx->mount_flags & WIMLIB_MOUNT_FLAG_UNIX_DATA) &&
-	    inode_get_unix_data(inode, &unix_data))
-	{
-		/* Use the user ID, group ID, mode, and device ID from the
-		 * inode's extra UNIX metadata information.  */
-		stbuf->st_uid = unix_data.uid;
-		stbuf->st_gid = unix_data.gid;
-		stbuf->st_mode = unix_data.mode;
-		stbuf->st_rdev = unix_data.rdev;
-	} else {
-		/* Generate default values for the user ID, group ID, and mode.
-		 *
-		 * Note: in the case of an allow_other mount, fuse_context.uid
-		 * may not be the same as wimfs_context.owner_uid!  */
-		stbuf->st_uid = ctx->owner_uid;
-		stbuf->st_gid = ctx->owner_gid;
-		stbuf->st_mode = inode_default_unix_mode(inode);
-	}
+	inode_get_unix_data_fallback(ctx, inode, &unix_data);
 	stbuf->st_ino = inode->i_ino;
 	stbuf->st_nlink = inode->i_nlink;
 	stbuf->st_size = blob_size(blob);
@@ -1197,7 +1216,7 @@ out:
 }
 
 static int
-wimfs_chmod(const char *path, mode_t mask)
+wimfs_chmod(const char *path, mode_t mask FI_ARG)
 {
 	const struct wimfs_context *ctx = wimfs_get_context();
 	struct wim_inode *inode;
@@ -1222,7 +1241,7 @@ wimfs_chmod(const char *path, mode_t mask)
 }
 
 static int
-wimfs_chown(const char *path, uid_t uid, gid_t gid)
+wimfs_chown(const char *path, uid_t uid, gid_t gid FI_ARG)
 {
 	const struct wimfs_context *ctx = wimfs_get_context();
 	struct wim_inode *inode;
@@ -1278,7 +1297,7 @@ wimfs_ftruncate(const char *path, off_t size, struct fuse_file_info *fi)
 }
 
 static int
-wimfs_getattr(const char *path, struct stat *stbuf)
+wimfs_getattr(const char *path, struct stat *stbuf FI_ARG)
 {
 	const struct wimfs_context *ctx = wimfs_get_context();
 	struct wim_dentry *dentry;
@@ -1913,7 +1932,7 @@ wimfs_symlink(const char *to, const char *from)
 }
 
 static int
-wimfs_truncate(const char *path, off_t size)
+wimfs_truncate(const char *path, off_t size FI_ARG)
 {
 	const struct wimfs_context *ctx = wimfs_get_context();
 	struct wim_dentry *dentry;
@@ -1946,6 +1965,16 @@ wimfs_truncate(const char *path, off_t size)
 		return -errno;
 	blob->size = size;
 	touch_inode(dentry->d_inode);
+
+#if FUSE_MAJOR_VERSION > 2
+	/* Erase the set{u,g}id and cap bits. */
+	struct wimlib_unix_data unix_data;
+	inode_get_unix_data_fallback(ctx, dentry->d_inode, &unix_data);
+	unix_data.mode &= 01777;
+	if (!inode_set_unix_data(inode, &unix_data, which))
+		return -ENOMEM;
+#endif
+
 	return 0;
 }
 
@@ -1978,7 +2007,7 @@ wimfs_unlink(const char *path)
  * Note that alternate data streams do not have their own timestamps.
  */
 static int
-wimfs_utimens(const char *path, const struct timespec tv[2])
+wimfs_utimens(const char *path, const struct timespec tv[2] FI_ARG)
 {
 	WIMStruct *wim = wimfs_get_WIMStruct();
 	struct wim_inode *inode;
@@ -2003,7 +2032,7 @@ wimfs_utimens(const char *path, const struct timespec tv[2])
 }
 #else /* HAVE_UTIMENSAT */
 static int
-wimfs_utime(const char *path, struct utimbuf *times)
+wimfs_utime(const char *path, struct utimbuf *times FI_ARG)
 {
 	WIMStruct *wim = wimfs_get_WIMStruct();
 	struct wim_inode *inode;
@@ -2033,14 +2062,28 @@ wimfs_write(const char *path, const char *buf, size_t size,
 		fd->f_blob->size = offset + size;
 
 	touch_inode(fd->f_inode);
+
+#if FUSE_MAJOR_VERSION > 2
+	/* Erase the set{u,g}id bits. */
+	struct wimlib_unix_data unix_data;
+	inode_get_unix_data_fallback(wimfs_get_context(), dentry->d_inode, &unix_data);
+	unix_data.mode &= 01777;
+	if (!inode_set_unix_data(inode, &unix_data, which))
+		return -ENOMEM;
+	/* We do not need wimfs_removexattr(path, "security.capability");
+	   here because we don't support the security namespace. */
+#endif
+
 	return ret;
 }
 
 static const struct fuse_operations wimfs_operations = {
 	.chmod       = wimfs_chmod,
 	.chown       = wimfs_chown,
+#if FUSE_MAJOR_VERSION <= 2
 	.fgetattr    = wimfs_fgetattr,
 	.ftruncate   = wimfs_ftruncate,
+#endif
 	.getattr     = wimfs_getattr,
 	.getxattr    = wimfs_getxattr,
 	.link        = wimfs_link,

@@ -154,11 +154,14 @@ AC_MSG_RESULT([$WITH_FUSE])
 
 if test "$WITH_FUSE" = "yes"; then
 
-	PKG_CHECK_MODULES([LIBFUSE], [fuse], [],
-		[AC_MSG_ERROR([Cannot find libfuse!
-		Without libfuse, wimlib cannot include support for mounting WIM
-		images.  Either install libfuse, or configure --without-fuse to
-		disable this feature.])])
+	PKG_CHECK_MODULES([LIBFUSE], [fuse3], [], [
+		PKG_CHECK_MODULES([LIBFUSE], [fuse], [], [
+			AC_MSG_ERROR([Cannot find libfuse!
+			Without libfuse, wimlib cannot include support for mounting WIM
+			images.  Either install libfuse, or configure --without-fuse to
+			disable this feature.])
+		])
+	])
 	PKGCONFIG_PRIVATE_REQUIRES="$PKGCONFIG_PRIVATE_REQUIRES fuse"
 	AC_DEFINE([WITH_FUSE], [1], [Define to 1 if using FUSE support])
 
